@@ -44,7 +44,7 @@ acl_process_autorun_profiler_scan_chain(unsigned int physical_device_id,
 // to verify that the hardware and HAL have an identical view of the CSR
 // address map.
 #define CSR_VERSION_ID_181 (3)
-#define CSR_VERSION_ID (4)
+#define CSR_VERSION_ID (5)
 
 // Address map
 // For unit tests to work, these defines must match those in the unit test
@@ -73,6 +73,13 @@ acl_process_autorun_profiler_scan_chain(unsigned int physical_device_id,
 #define KERNEL_OFFSET_CSR_PROFILE_STOP_CYCLE 0x20
 #define KERNEL_OFFSET_FINISH_COUNTER 0x28
 #define KERNEL_OFFSET_INVOCATION_IMAGE 0x30
+
+#define KERNEL_OFFSET_GO_REG 0x4
+#define KERNEL_OFFSET_DONE_REG 0x8
+#define KERNEL_OFFSET_STALLED_REG 0xc
+#define KERNEL_OFFSET_UNSTALL_REG 0x10
+#define KERNEL_OFFSET_PROFILE_TEMPORAL_STATUS 0x14
+#define KERNEL_OFFSET_PROFILE_TEMPORAL_RESET 0x18
 
 // Backwards compatibility with CSR_VERSION_ID 3
 #define KERNEL_OFFSET_INVOCATION_IMAGE_181 0x28
@@ -1254,10 +1261,14 @@ void acl_kernel_if_launch_kernel_on_custom_sof(
   }
   kern->accel_queue_front[accel_id] = next_launch_index;
 
-  unsigned int new_csr = 0;
-  acl_kernel_cra_read(kern, accel_id, KERNEL_OFFSET_CSR, &new_csr);
-  ACL_KERNEL_SET_BIT(new_csr, KERNEL_CSR_GO);
-  acl_kernel_cra_write(kern, accel_id, KERNEL_OFFSET_CSR, new_csr);
+  // unsigned int new_csr = 0;
+  // acl_kernel_cra_read(kern, accel_id, KERNEL_OFFSET_CSR, &new_csr);
+  // ACL_KERNEL_SET_BIT(new_csr, KERNEL_CSR_GO);
+  // acl_kernel_cra_write(kern, accel_id, KERNEL_OFFSET_CSR, new_csr);
+
+  // Old code sets go bit in CSR
+  // New code should set go register in CSR
+  acl_kernel_cra_write(kern, accel_id, KERNEL_OFFSET_GO_REG, 1);
 
   // IRQ handler takes care of the completion event through
   // acl_kernel_if_update_status()
@@ -1336,6 +1347,18 @@ void acl_kernel_if_update_status(acl_kernel_if *kern) {
     csr = 0;
     acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &csr);
 
+    unsigned int done_reg = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_GO_REG, &done_reg);
+
+    unsigned int stalled_reg = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_STALLED_REG, &stalled_reg);
+
+    unsigned int unstall_reg = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_UNSTALL_REG, &unstall_reg);
+
+    unsigned int profile_temporal_status = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_PROFILE_TEMPORAL_STATUS, &profile_temporal_status);
+
     // Ignore non-status bits.
     // Required by Option 3 wrappers which now have a version info in
     // top 16 bits.
@@ -1349,23 +1372,26 @@ void acl_kernel_if_update_status(acl_kernel_if *kern) {
     ACL_KERNEL_IF_DEBUG_MSG(kern, ":: Accelerator %d reporting status %x.\n", k,
                             csr);
 
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_DONE) == 1) {
+    // if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_DONE) == 1) {
+    //   ACL_KERNEL_IF_DEBUG_MSG(kern, ":: Accelerator %d is done.\n", k);
+    // }
+
+    if (done_reg == 1) {
       ACL_KERNEL_IF_DEBUG_MSG(kern, ":: Accelerator %d is done.\n", k);
     }
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STALLED) == 1) {
+
+    if (stalled_reg) {
       ACL_KERNEL_IF_DEBUG_MSG(kern, ":: Accelerator %d is stalled.\n", k);
     }
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_UNSTALL) == 1) {
+    if (unstall_reg == 1) {
       ACL_KERNEL_IF_DEBUG_MSG(kern, ":: Accelerator %d is unstalled.\n", k);
     }
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_PROFILE_TEMPORAL_STATUS) == 1) {
+    if (profile_temporal_status == 1) {
       ACL_KERNEL_IF_DEBUG_MSG(
           kern, ":: Accelerator %d ready for temporal profile readback.\n", k);
     }
 
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_DONE) == 0 &&
-        ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STALLED) == 0 &&
-        ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_PROFILE_TEMPORAL_STATUS) == 0)
+    if (done_reg == 0 && stalled_reg == 0 && profile_temporal_status == 0)
       continue;
 
     activation_id = kern->accel_job_ids[k][next_queue_back];
@@ -1382,46 +1408,47 @@ void acl_kernel_if_update_status(acl_kernel_if *kern) {
                               k, printf_size);
 
       // kernel is stalled because the printf buffer is full
-      if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STALLED) == 1) {
+      if (stalled_reg == 1) {
         // clear interrupt
-        unsigned int new_csr = 0;
-        acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &new_csr);
-        ACL_KERNEL_CLEAR_BIT(new_csr, KERNEL_CSR_STALLED);
+        // unsigned int new_csr = 0;
+        // acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &new_csr);
+        // ACL_KERNEL_CLEAR_BIT(new_csr, KERNEL_CSR_STALLED);
 
-        ACL_KERNEL_IF_DEBUG_MSG(kern,
-                                ":: Calling acl_process_printf_buffer_fn with "
-                                "activation_id=%d and printf_size=%u.\n",
-                                activation_id, printf_size);
-        // update status, which will dump the printf buffer, set
-        // debug_dump_printf = 0
-        acl_process_printf_buffer_fn(activation_id, (int)printf_size, 0);
+        // ACL_KERNEL_IF_DEBUG_MSG(kern,
+        //                         ":: Calling acl_process_printf_buffer_fn with "
+        //                         "activation_id=%d and printf_size=%u.\n",
+        //                         activation_id, printf_size);
+        // // update status, which will dump the printf buffer, set
+        // // debug_dump_printf = 0
+        // acl_process_printf_buffer_fn(activation_id, (int)printf_size, 0);
 
-        ACL_KERNEL_IF_DEBUG_MSG(
-            kern, ":: Accelerator %d new csr is %x.\n", k,
-            ACL_KERNEL_READ_BIT_RANGE(new_csr, KERNEL_CSR_LAST_STATUS_BIT, 0));
+        // ACL_KERNEL_IF_DEBUG_MSG(
+        //     kern, ":: Accelerator %d new csr is %x.\n", k,
+        //     ACL_KERNEL_READ_BIT_RANGE(new_csr, KERNEL_CSR_LAST_STATUS_BIT, 0));
 
-        acl_kernel_cra_write(kern, k, KERNEL_OFFSET_CSR, new_csr);
+        // acl_kernel_cra_write(kern, k, KERNEL_OFFSET_CSR, new_csr);
+        acl_kernel_cra_write(kern, k, KERNEL_OFFSET_STALLED_REG, 0);
         continue;
       }
     }
 
     // Start profile counter readback if profile interrupt and not done
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_PROFILE_TEMPORAL_STATUS) != 0 &&
-        ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_DONE) == 0) {
+    if (profile_temporal_status != 0 &&
+        done_reg == 0) {
       ACL_KERNEL_IF_DEBUG_MSG(
           kern, ":: Issuing profile reset command:: Accelerator %d.\n", k);
 
       // Reset temporal profiling counter
       int status;
-      unsigned int ctrl_val;
-      status = acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &ctrl_val);
-      if (status) {
-        ACL_KERNEL_IF_DEBUG_MSG(
-            kern, ":: Got bad status reading CSR ctrl reg:: Accelerator %d.\n",
-            k);
-      }
-      ACL_KERNEL_SET_BIT(ctrl_val, KERNEL_CSR_PROFILE_TEMPORAL_RESET);
-      status = acl_kernel_cra_write(kern, k, KERNEL_OFFSET_CSR, ctrl_val);
+      // unsigned int ctrl_val;
+      // status = acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &ctrl_val);
+      // if (status) {
+      //   ACL_KERNEL_IF_DEBUG_MSG(
+      //       kern, ":: Got bad status reading CSR ctrl reg:: Accelerator %d.\n",
+      //       k);
+      // }
+      // ACL_KERNEL_SET_BIT(ctrl_val, KERNEL_CSR_PROFILE_TEMPORAL_RESET);
+      status = acl_kernel_cra_write(kern, k, KERNEL_OFFSET_PROFILE_TEMPORAL_RESET, 1);
       if (status) {
         ACL_KERNEL_IF_DEBUG_MSG(
             kern, ":: Got bad status writing CSR ctrl reg:: Accelerator %d.\n",
@@ -1568,15 +1595,21 @@ void acl_kernel_if_dump_status(acl_kernel_if *kern) {
     // Read the accelerator's status register
     acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &csr);
 
+    unsigned int done_reg = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_DONE_REG, &done_reg);
+
+    unsigned int stalled_reg = 0;
+    acl_kernel_cra_read(kern, k, KERNEL_OFFSET_STALLED_REG, &stalled_reg);
+
     kern->io.printf("  Kernel %2u Status: 0x%08x", k, csr);
     if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STARTED) &&
-        !ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STALLED))
+        !stalled_reg)
       kern->io.printf(" running");
-    else if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_STALLED))
+    else if (stalled_reg)
       kern->io.printf(" stalled");
     else
       kern->io.printf(" idle");
-    if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_DONE))
+    if (done_reg)
       kern->io.printf(" finish-pending");
     if (ACL_KERNEL_READ_BIT(csr, KERNEL_CSR_VALID_IN))
       kern->io.printf(" valid_in");
@@ -1667,15 +1700,16 @@ void acl_kernel_if_unstall_kernel(acl_kernel_if *kern, int activation_id) {
 
       if (activation_id == kern->accel_job_ids[k][i]) {
         // un-stall the kernel by writing to unstall bit
-        unsigned int new_csr = 0;
-        acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &new_csr);
+        // unsigned int new_csr = 0;
+        // acl_kernel_cra_read(kern, k, KERNEL_OFFSET_CSR, &new_csr);
 
-        ACL_KERNEL_SET_BIT(new_csr, KERNEL_CSR_UNSTALL);
-        ACL_KERNEL_IF_DEBUG_MSG(
-            kern, ":: Accelerator %d new csr is %x.\n", k,
-            ACL_KERNEL_READ_BIT_RANGE(new_csr, KERNEL_CSR_LAST_STATUS_BIT, 0));
+        // ACL_KERNEL_SET_BIT(new_csr, KERNEL_CSR_UNSTALL);
+        // ACL_KERNEL_IF_DEBUG_MSG(
+        //     kern, ":: Accelerator %d new csr is %x.\n", k,
+        //     ACL_KERNEL_READ_BIT_RANGE(new_csr, KERNEL_CSR_LAST_STATUS_BIT, 0));
 
-        acl_kernel_cra_write(kern, k, KERNEL_OFFSET_CSR, new_csr);
+        // acl_kernel_cra_write(kern, k, KERNEL_OFFSET_CSR, new_csr);
+        acl_kernel_cra_write(kern, k, KERNEL_OFFSET_UNSTALL_REG, 1);
       }
     }
   }
@@ -1787,15 +1821,15 @@ int acl_kernel_if_get_profile_data(acl_kernel_if *kern, cl_uint accel_id,
     ACL_KERNEL_IF_DEBUG_MSG(
         kern, ":: Issuing profile temporal reset command:: Accelerator %d.\n",
         accel_id);
-    unsigned int ctrl_val;
+    // unsigned int ctrl_val;
     int status;
-    status = acl_kernel_cra_read(kern, accel_id, KERNEL_OFFSET_CSR, &ctrl_val);
-    ACL_KERNEL_IF_DEBUG_MSG(
-        kern, ":: Finished reading profiler data from %d.\n", accel_id);
-    if (status)
-      return status;
-    ACL_KERNEL_SET_BIT(ctrl_val, KERNEL_CSR_PROFILE_TEMPORAL_RESET);
-    status = acl_kernel_cra_write(kern, accel_id, KERNEL_OFFSET_CSR, ctrl_val);
+    // status = acl_kernel_cra_read(kern, accel_id, KERNEL_OFFSET_CSR, &ctrl_val);
+    // ACL_KERNEL_IF_DEBUG_MSG(
+    //     kern, ":: Finished reading profiler data from %d.\n", accel_id);
+    // if (status)
+    //   return status;
+    // ACL_KERNEL_SET_BIT(ctrl_val, KERNEL_CSR_PROFILE_TEMPORAL_RESET);
+    status = acl_kernel_cra_write(kern, accel_id, KERNEL_OFFSET_PROFILE_TEMPORAL_RESET, 1);
     if (status)
       return status;
   }
